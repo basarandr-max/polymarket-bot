@@ -1,1 +1,0 @@
-worker: python polymarket_test_bot.py
