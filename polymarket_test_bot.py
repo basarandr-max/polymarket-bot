@@ -32,8 +32,7 @@ class Config:
     GAMMA_API = "https://gamma-api.polymarket.com"
 
     TELEGRAM_TOKEN = "8616934680:AAHSkEqHzw2jhDyu431RXYsPkaWVCKxCbKc"
-    TELEGRAM_CHAT_ID = "123456789"  # <-- KENDİ ID'Nİ YAZ
-
+    TELEGRAM_CHAT_ID = "860803224"
     TRACKED_USERS = [
         {"name": "Oddn",             "wallet": "0xa53c26443fb636d8ae31ac24f62fc1d5ef8f67a5"},
         {"name": "Swisstony",        "wallet": "0x204f72f35326db932158cba6adff0b9a1da95e14"},
