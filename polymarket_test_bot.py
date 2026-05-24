@@ -1,33 +1,34 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-POLYMARKET COPY TRADING BOT v3.0
+POLYMARKET COPY TRADING BOT v3.2
 =================================
-Düzeltmeler:
-- Tek kaynak doğruluk (my_positions kaldırıldı)
-- Doğru kapanış algılama (share miktar takibi)
-- ID uyuşmazlığı çözüldü
-- Kısmi kapanış desteği
-- Kesin nakit kontrolü
+Fixes:
+- /activity endpoint for real trades
+- Transaction hash tracking
+- Proper position deduplication
+- Minimum trade size filter
+- Strict cash control
 """
 
 import asyncio
 import aiohttp
-import json
 import time
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import datetime
 from dataclasses import dataclass, field
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Set
 import logging
 import sys
 
-# ==================== KONFİGÜRASYON ====================
+# ==================== CONFIG ====================
 class Config:
     TEST_MODE = True
     INITIAL_CAPITAL = Decimal('50')
-    TRADE_SIZE = Decimal('5')       # sabit $5 per trade
-    MIN_CASH = Decimal('5')         # en az $5 nakit kalsın
-    SCAN_INTERVAL = 15              # saniye
+    TRADE_SIZE = Decimal('5')       # fixed $5 per trade
+    MIN_CASH = Decimal('5')         # keep at least $5 cash
+    SCAN_INTERVAL = 15              # seconds
+    MIN_USDC_SIZE = Decimal('1')    # minimum trade size to copy ($1)
 
     DATA_API = "https://data-api.polymarket.com"
     GAMMA_API = "https://gamma-api.polymarket.com"
@@ -43,7 +44,7 @@ class Config:
         {"name": "Tiger200",         "wallet": "0x6211f97a76ed5c4b1d658f637041ac5f293db89e"},
     ]
 
-# ==================== VERİ MODELLERİ ====================
+# ==================== DATA MODELS ====================
 
 @dataclass
 class Position:
@@ -106,92 +107,89 @@ class TelegramNotifier:
             async with self.session.post(url, json=payload) as resp:
                 if resp.status != 200:
                     text = await resp.text()
-                    logging.warning(f"Telegram hatasi: {resp.status} - {text}")
+                    logging.warning(f"Telegram error: {resp.status} - {text}")
         except Exception as e:
-            logging.error(f"Telegram hatasi: {e}")
+            logging.error(f"Telegram error: {e}")
 
     async def send_open(self, pos: Position, portfolio: Portfolio):
-        pnl_emoji = "🟢" if portfolio.total_pnl >= 0 else "🔴"
+        pnl_emoji = "+" if portfolio.total_pnl >= 0 else "-"
         msg = (
-            f"📂 *POZİSYON AÇILDI*\n\n"
-            f"👤 Trader: *{pos.trader_name}*\n"
-            f"🏟️ Pazar: {pos.market_title[:50]}\n"
-            f"📊 Yön: *{pos.side}*\n"
-            f"💰 Giriş: ${pos.entry_price:.3f}\n"
-            f"💵 Yatırılan: ${pos.size_usd:.2f}\n"
-            f"⏰ {pos.opened_at.strftime('%H:%M:%S')}\n\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"💼 *PORTFÖY*\n"
-            f"Nakit: ${portfolio.cash:.2f}\n"
-            f"Açık: ${portfolio.open_value:.2f} ({len(portfolio.open_positions)} pozisyon)\n"
-            f"Toplam: ${portfolio.total_value:.2f}\n"
-            f"{pnl_emoji} PnL: ${portfolio.total_pnl:.2f} (%{portfolio.pnl_percent:.1f})"
+            f"[POSITION OPENED]\n\n"
+            f"Trader: *{pos.trader_name}*\n"
+            f"Market: {pos.market_title[:50]}\n"
+            f"Side: *{pos.side}*\n"
+            f"Entry: ${pos.entry_price:.3f}\n"
+            f"Size: ${pos.size_usd:.2f}\n"
+            f"Time: {pos.opened_at.strftime('%H:%M:%S')}\n\n"
+            f"--- PORTFOLIO ---\n"
+            f"Cash: ${portfolio.cash:.2f}\n"
+            f"Open: ${portfolio.open_value:.2f} ({len(portfolio.open_positions)} positions)\n"
+            f"Total: ${portfolio.total_value:.2f}\n"
+            f"PnL: ${portfolio.total_pnl:.2f} ({pnl_emoji}{portfolio.pnl_percent:.1f}%)"
         )
         await self.send(msg)
 
-    async def send_close(self, pos: Position, pnl: Decimal, close_price: Decimal, portfolio: Portfolio, partial: bool = False):
-        pnl_emoji = "✅" if pnl >= 0 else "❌"
-        port_emoji = "🟢" if portfolio.total_pnl >= 0 else "🔴"
+    async def send_close(self, pos: Position, pnl: Decimal, close_price: Decimal, portfolio: Portfolio):
+        pnl_emoji = "+" if pnl >= 0 else "-"
+        port_emoji = "+" if portfolio.total_pnl >= 0 else "-"
         win_rate = (portfolio.winning_trades / portfolio.total_trades * 100) if portfolio.total_trades > 0 else 0
-        partial_text = " (KISMİ)" if partial else ""
         msg = (
-            f"{pnl_emoji} *POZİSYON KAPATILDI{partial_text}*\n\n"
-            f"👤 Trader: *{pos.trader_name}*\n"
-            f"🏟️ Pazar: {pos.market_title[:50]}\n"
-            f"📊 Yön: *{pos.side}*\n"
-            f"📥 Giriş: ${pos.entry_price:.3f}\n"
-            f"📤 Çıkış: ${close_price:.3f}\n"
-            f"💵 Yatırılan: ${pos.size_usd:.2f}\n"
-            f"{'📈' if pnl >= 0 else '📉'} İşlem PnL: ${pnl:.2f}\n"
-            f"⏰ {datetime.now().strftime('%H:%M:%S')}\n\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"💼 *PORTFÖY*\n"
-            f"Nakit: ${portfolio.cash:.2f}\n"
-            f"Açık: ${portfolio.open_value:.2f}\n"
-            f"Toplam: ${portfolio.total_value:.2f}\n"
-            f"{port_emoji} Toplam PnL: ${portfolio.total_pnl:.2f} (%{portfolio.pnl_percent:.1f})\n"
-            f"🎯 Kazanma oranı: %{win_rate:.0f} ({portfolio.winning_trades}W/{portfolio.losing_trades}L)"
+            f"[POSITION CLOSED]\n\n"
+            f"Trader: *{pos.trader_name}*\n"
+            f"Market: {pos.market_title[:50]}\n"
+            f"Side: *{pos.side}*\n"
+            f"Entry: ${pos.entry_price:.3f}\n"
+            f"Exit: ${close_price:.3f}\n"
+            f"Size: ${pos.size_usd:.2f}\n"
+            f"Trade PnL: {pnl_emoji}${pnl:.2f}\n"
+            f"Time: {datetime.now().strftime('%H:%M:%S')}\n\n"
+            f"--- PORTFOLIO ---\n"
+            f"Cash: ${portfolio.cash:.2f}\n"
+            f"Open: ${portfolio.open_value:.2f}\n"
+            f"Total: ${portfolio.total_value:.2f}\n"
+            f"Total PnL: {port_emoji}${portfolio.total_pnl:.2f} ({port_emoji}{portfolio.pnl_percent:.1f}%)\n"
+            f"Win Rate: {win_rate:.0f}% ({portfolio.winning_trades}W/{portfolio.losing_trades}L)"
         )
         await self.send(msg)
 
     async def send_portfolio(self, portfolio: Portfolio):
-        pnl_emoji = "🟢" if portfolio.total_pnl >= 0 else "🔴"
+        pnl_emoji = "+" if portfolio.total_pnl >= 0 else "-"
         win_rate = (portfolio.winning_trades / portfolio.total_trades * 100) if portfolio.total_trades > 0 else 0
         lines = [
-            f"📊 *PORTFÖY DURUMU*\n",
-            f"💰 Başlangıç: ${portfolio.initial_capital:.2f}",
-            f"💵 Nakit: ${portfolio.cash:.2f}",
-            f"📂 Açık: ${portfolio.open_value:.2f} ({len(portfolio.open_positions)} pozisyon)",
-            f"💼 Toplam: ${portfolio.total_value:.2f}",
-            f"{pnl_emoji} PnL: ${portfolio.total_pnl:.2f} (%{portfolio.pnl_percent:.1f})",
-            f"🎯 Kazanma: %{win_rate:.0f} ({portfolio.winning_trades}W/{portfolio.losing_trades}L)\n",
+            f"[PORTFOLIO STATUS]\n",
+            f"Initial: ${portfolio.initial_capital:.2f}",
+            f"Cash: ${portfolio.cash:.2f}",
+            f"Open: ${portfolio.open_value:.2f} ({len(portfolio.open_positions)} positions)",
+            f"Total: ${portfolio.total_value:.2f}",
+            f"PnL: {pnl_emoji}${portfolio.total_pnl:.2f} ({pnl_emoji}{portfolio.pnl_percent:.1f}%)",
+            f"Win Rate: {win_rate:.0f}% ({portfolio.winning_trades}W/{portfolio.losing_trades}L)\n",
         ]
         if portfolio.open_positions:
-            lines.append("━━━━━━━━━━━━━━━━━━")
-            lines.append("📂 *Açık Pozisyonlar:*")
+            lines.append("--- OPEN POSITIONS ---")
             for pos in portfolio.open_positions.values():
-                lines.append(f"• {pos.trader_name} | {pos.side} | ${pos.size_usd:.2f} | {pos.market_title[:25]}")
+                lines.append(f"- {pos.trader_name} | {pos.side} | ${pos.size_usd:.2f} | {pos.market_title[:25]}")
         else:
-            lines.append("📭 Açık pozisyon yok")
-        lines.append(f"\n⏰ {datetime.now().strftime('%H:%M:%S')}")
+            lines.append("No open positions")
+        lines.append(f"\nTime: {datetime.now().strftime('%H:%M:%S')}")
         await self.send("\n".join(lines))
 
     async def send_no_cash(self, portfolio: Portfolio):
         await self.send(
-            f"⚠️ *YETERSİZ NAKİT*\n\n"
-            f"Nakit: ${portfolio.cash:.2f} — yeni pozisyon açılamıyor.\n"
-            f"Mevcut pozisyonların kapanmasını bekliyor...\n\n"
-            f"Toplam: ${portfolio.total_value:.2f}"
+            f"[INSUFFICIENT CASH]\n\n"
+            f"Cash: ${portfolio.cash:.2f} - cannot open new position.\n"
+            f"Waiting for positions to close...\n\n"
+            f"Total: ${portfolio.total_value:.2f}"
         )
 
-# ==================== KULLANICI TAKİPÇİSİ ====================
+# ==================== USER TRACKER ====================
 class UserTracker:
     def __init__(self):
         self.session: Optional[aiohttp.ClientSession] = None
         self.last_request = 0
-        self.seen_tx: Dict[str, set] = {u["wallet"]: set() for u in Config.TRACKED_USERS}
-        # YENİ: Her trader'ın pazar başına share miktarını takip et
-        self.user_shares: Dict[str, Dict[str, Decimal]] = {u["wallet"]: {} for u in Config.TRACKED_USERS}
+        # Transaction hash'leri takip et
+        self.seen_tx: Dict[str, Set[str]] = {u["wallet"]: set() for u in Config.TRACKED_USERS}
+        # Aktif pozisyonlar (conditionId + outcomeIndex -> tx_hash)
+        self.active_positions: Dict[str, Dict[str, str]] = {u["wallet"]: {} for u in Config.TRACKED_USERS}
         self.initialized: Dict[str, bool] = {u["wallet"]: False for u in Config.TRACKED_USERS}
 
     async def __aenter__(self):
@@ -211,119 +209,76 @@ class UserTracker:
             async with self.session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
                 if resp.status == 200:
                     return await resp.json()
+                logging.warning(f"API error: {resp.status} - {url}")
                 return None
         except Exception as e:
-            logging.debug(f"Request hatasi: {e}")
+            logging.debug(f"Request error: {e}")
             return None
 
-    async def get_new_activities(self, user: dict) -> List[dict]:
-        url = f"{Config.DATA_API}/activity?user={user['wallet']}&limit=20"
+    def _make_pos_key(self, condition_id: str, outcome_index: int) -> str:
+        return f"{condition_id}_{outcome_index}"
+
+    async def get_new_trades(self, user: dict) -> List[dict]:
+        """
+        /activity endpoint'inden yeni trade'leri cek.
+        Sadece TRADE tipindekiler ve usdcSize >= MIN_USDC_SIZE olanlar.
+        """
+        url = f"{Config.DATA_API}/activity?user={user['wallet']}&limit=50&type=TRADE"
         data = await self._request(url)
+
         if not data or not isinstance(data, list):
             return []
 
-        # İlk taramada sadece mevcut tx'leri kaydet, bildirim gönderme
-        if not self.initialized[user["wallet"]]:
-            for activity in data:
-                tx_hash = activity.get("transactionHash", "")
-                if tx_hash:
-                    self.seen_tx[user["wallet"]].add(tx_hash)
-            return []
+        wallet = user["wallet"]
+        new_trades = []
 
-        new_activities = []
         for activity in data:
             tx_hash = activity.get("transactionHash", "")
-            if tx_hash and tx_hash not in self.seen_tx[user["wallet"]]:
-                self.seen_tx[user["wallet"]].add(tx_hash)
-                activity["tracked_user"] = user["name"]
-                activity["tracked_wallet"] = user["wallet"]
-                new_activities.append(activity)
-        return new_activities
-
-    async def get_user_positions(self, user: dict) -> List[dict]:
-        url = f"{Config.DATA_API}/positions?user={user['wallet']}"
-        data = await self._request(url)
-        if not data or not isinstance(data, list):
-            return []
-        return data
-
-    async def update_user_shares(self, user: dict) -> Dict[str, Decimal]:
-        """Trader'ın güncel share miktarlarını çek ve kaydet"""
-        positions = await self.get_user_positions(user)
-        wallet = user["wallet"]
-        
-        current_shares = {}
-        for pos in positions:
-            cid = pos.get("conditionId", pos.get("asset", ""))
-            if not cid:
+            if not tx_hash:
                 continue
-            # size veya quantity field'ını bul
-            size_raw = pos.get("size", pos.get("quantity", pos.get("amount", "0")))
+
+            # Ilk taramada sadece kaydet
+            if not self.initialized[wallet]:
+                self.seen_tx[wallet].add(tx_hash)
+                continue
+
+            # Daha once gorduk mu?
+            if tx_hash in self.seen_tx[wallet]:
+                continue
+
+            self.seen_tx[wallet].add(tx_hash)
+
+            # Min trade size kontrolu
+            usdc_size_raw = activity.get("usdcSize", "0")
             try:
-                size = Decimal(str(size_raw))
+                usdc_size = Decimal(str(usdc_size_raw))
             except:
-                size = Decimal("0")
-            current_shares[cid] = size
-        
-        return current_shares
+                usdc_size = Decimal("0")
 
-    async def detect_closes(self, user: dict) -> List[dict]:
-        """
-        YENİ: Share miktar değişimine göre kapanış tespiti
-        """
-        current_shares = await self.update_user_shares(user)
-        wallet = user["wallet"]
-        
+            if usdc_size < Config.MIN_USDC_SIZE:
+                logging.debug(f"Trade too small (${usdc_size:.2f}), skipping")
+                continue
+
+            activity["tracked_user"] = user["name"]
+            activity["tracked_wallet"] = wallet
+            new_trades.append(activity)
+
         if not self.initialized[wallet]:
-            self.user_shares[wallet] = current_shares
             self.initialized[wallet] = True
-            return []
+            logging.info(f"Initialized {user['name']}: {len(self.seen_tx[wallet])} trades cached")
 
-        prev_shares = self.user_shares[wallet]
-        closed = []
-        
-        for cid, prev_size in prev_shares.items():
-            curr_size = current_shares.get(cid, Decimal("0"))
-            
-            if curr_size < prev_size:
-                # Share azaldı = kapanış (kısmi veya tam)
-                closed_item = {
-                    "conditionId": cid,
-                    "tracked_user": user["name"],
-                    "tracked_wallet": wallet,
-                    "event": "CLOSE",
-                    "prev_size": prev_size,
-                    "curr_size": curr_size,
-                    "closed_size": prev_size - curr_size,
-                    "close_ratio": (prev_size - curr_size) / prev_size if prev_size > 0 else Decimal("1"),
-                    "price": Decimal("0.5"),  # Son fiyatı activity'den alacağız
-                }
-                closed.append(closed_item)
-                logging.info(f"KAPANIŞ TESPİT: {user['name']} | {cid[:15]} | "
-                           f"{prev_size:.4f} -> {curr_size:.4f} | "
-                           f"Kapanan: {closed_item['closed_size']:.4f}")
-        
-        self.user_shares[wallet] = current_shares
-        return closed
+        return new_trades
 
     async def scan_all(self) -> dict:
-        opens = []
-        closes = []
-        for user in Config.TRACKED_USERS:
-            # YENİ: Önce kapanışları tespit et (share miktarı değişimi)
-            closed_positions = await self.detect_closes(user)
-            closes.extend(closed_positions)
-            
-            # Sonra yeni aktiviteleri (açılışlar)
-            new_acts = await self.get_new_activities(user)
-            for act in new_acts:
-                side = act.get("side", "").upper()
-                if side in ("BUY", "YES", "NO"):
-                    opens.append(act)
-        
-        return {"opens": opens, "closes": closes}
+        all_trades = []
 
-# ==================== ANA BOT ====================
+        for user in Config.TRACKED_USERS:
+            trades = await self.get_new_trades(user)
+            all_trades.extend(trades)
+
+        return {"trades": all_trades}
+
+# ==================== MAIN BOT ====================
 class PolymarketCopyBot:
     def __init__(self):
         self.tracker = UserTracker()
@@ -333,194 +288,152 @@ class PolymarketCopyBot:
         self.scan_count = 0
         self.no_cash_notified = False
 
-    def _position_id(self, wallet: str, condition_id: str, side: str) -> str:
-        side = side.upper()
-        if side in ("BUY", "YES"):
-            side = "YES"
-        elif side in ("SELL", "NO"):
-            side = "NO"
+    def _position_id(self, wallet: str, condition_id: str, outcome_index: int) -> str:
+        side = "YES" if outcome_index == 1 else "NO"
         return f"{wallet[:8]}_{str(condition_id)[:30]}_{side}"
 
-    def _parse_activity(self, activity: dict) -> dict:
-        side = activity.get("side", "BUY").upper()
-        if side in ("BUY", "YES"):
-            side = "YES"
-        elif side in ("SELL", "NO"):
-            side = "NO"
-        
-        price_raw = activity.get("price", activity.get("avgPrice", "0.5"))
-        try:
-            price = Decimal(str(price_raw))
-            if price <= 0 or price > 1:
-                price = Decimal("0.5")
-        except:
-            price = Decimal("0.5")
-        
-        title = activity.get("title", activity.get("question", activity.get("market", "Bilinmiyor")))
-        slug = activity.get("conditionId", activity.get("slug", activity.get("market", "")))
-        return {"side": side, "price": price, "title": str(title)[:60], "slug": str(slug)}
+    def _get_side_from_outcome(self, outcome_index: int) -> str:
+        return "YES" if outcome_index == 1 else "NO"
+
+    def _is_open_trade(self, activity: dict) -> bool:
+        """BUY = yeni pozisyon acma, SELL = kapatma"""
+        side = activity.get("side", "").upper()
+        return side == "BUY"
+
+    def _is_close_trade(self, activity: dict) -> bool:
+        side = activity.get("side", "").upper()
+        return side == "SELL"
 
     async def open_position(self, activity: dict, notifier: TelegramNotifier):
         wallet = activity.get("tracked_wallet", "")
-        condition_id = activity.get("conditionId", activity.get("market", activity.get("slug", "")))
-        side = activity.get("side", "YES")
-        pos_id = self._position_id(wallet, condition_id, side)
+        condition_id = activity.get("conditionId", "")
+        outcome_index = activity.get("outcomeIndex", 1)
+        pos_id = self._position_id(wallet, condition_id, outcome_index)
 
-        # Aynı pozisyon zaten açıksa atla
+        # Ayni pozisyon zaten aciksa atla
         if pos_id in self.portfolio.open_positions:
-            logging.debug(f"Pozisyon zaten açık, atlandı: {pos_id}")
+            logging.debug(f"Position already open, skipped: {pos_id}")
             return
 
-        # KESİN nakit kontrolü - negatif olmaması garanti
+        # Kesin nakit kontrolu
         if self.portfolio.cash < Config.TRADE_SIZE:
             if not self.no_cash_notified:
                 await notifier.send_no_cash(self.portfolio)
                 self.no_cash_notified = True
-            logging.info(f"Yetersiz nakit (${self.portfolio.cash:.2f}), pozisyon atlandı")
+            logging.info(f"Insufficient cash (${self.portfolio.cash:.2f}), position skipped")
             return
 
         self.no_cash_notified = False
-        parsed = self._parse_activity(activity)
-        trader_name = activity.get("tracked_user", "Bilinmiyor")
+
+        side = self._get_side_from_outcome(outcome_index)
+        trader_name = activity.get("tracked_user", "Unknown")
+
+        price_raw = activity.get("price", "0.5")
+        try:
+            price = Decimal(str(price_raw))
+            price = min(max(price, Decimal("0.01")), Decimal("0.99"))
+        except:
+            price = Decimal("0.5")
+
+        title = activity.get("title", activity.get("question", "Unknown"))
 
         pos = Position(
             position_id=pos_id,
             trader_name=trader_name,
-            market_title=parsed["title"],
-            market_slug=parsed["slug"],
-            side=parsed["side"],
-            entry_price=parsed["price"],
+            market_title=str(title)[:60],
+            market_slug=str(condition_id)[:30],
+            side=side,
+            entry_price=price,
             size_usd=Config.TRADE_SIZE,
         )
 
-        # TEK KAYNAK: sadece portfolio.open_positions kullan
         self.portfolio.open_positions[pos_id] = pos
         self.portfolio.cash -= Config.TRADE_SIZE
 
-        logging.info(f"AÇILDI: {trader_name} | {parsed['side']} | ${Config.TRADE_SIZE} | Nakit: ${self.portfolio.cash:.2f}")
+        logging.info(f"OPENED: {trader_name} | {side} | ${Config.TRADE_SIZE} | Cash: ${self.portfolio.cash:.2f}")
         await notifier.send_open(pos, self.portfolio)
 
     async def close_position(self, activity: dict, notifier: TelegramNotifier):
-        """
-        YENİ: conditionId'ye göre eşleştir, kısmi kapanış desteği
-        """
-        condition_id = activity.get("conditionId", "")
         wallet = activity.get("tracked_wallet", "")
-        
-        if not condition_id:
-            logging.warning("Kapanış activity'sinde conditionId yok")
+        condition_id = activity.get("conditionId", "")
+        outcome_index = activity.get("outcomeIndex", 1)
+        pos_id = self._position_id(wallet, condition_id, outcome_index)
+
+        if pos_id not in self.portfolio.open_positions:
+            logging.info(f"Position not found for closing: {pos_id[:30]}...")
             return
 
-        # Bu pazarda açık pozisyonumuz var mı?
-        matching = []
-        for pos_id, pos in list(self.portfolio.open_positions.items()):
-            if pos.market_slug == condition_id or condition_id in pos_id:
-                matching.append((pos_id, pos))
-        
-        if not matching:
-            logging.info(f"Kapatılmaya çalışılan pazar bizde yok: {condition_id[:20]}...")
-            return
+        pos = self.portfolio.open_positions[pos_id]
 
-        # Kapanış oranı (kısmi kapanış için)
-        close_ratio = activity.get("close_ratio", Decimal("1"))
-        if isinstance(close_ratio, (int, float, str)):
-            try:
-                close_ratio = Decimal(str(close_ratio))
-            except:
-                close_ratio = Decimal("1")
-        
-        # Son fiyatı belirle
-        price_raw = activity.get("price", activity.get("avgPrice", None))
-        if price_raw:
-            try:
-                close_price = Decimal(str(price_raw))
-                close_price = min(max(close_price, Decimal("0.01")), Decimal("0.99"))
-            except:
-                close_price = Decimal("0.5")
+        # Cikis fiyati
+        price_raw = activity.get("price", "0.5")
+        try:
+            close_price = Decimal(str(price_raw))
+            close_price = min(max(close_price, Decimal("0.01")), Decimal("0.99"))
+        except:
+            close_price = pos.entry_price
+
+        # PnL hesapla
+        shares = pos.size_usd / pos.entry_price
+        pnl = shares * (close_price - pos.entry_price)
+
+        # Portfoy guncelle
+        self.portfolio.cash += pos.size_usd + pnl
+        self.portfolio.realized_pnl += pnl
+        self.portfolio.total_trades += 1
+
+        if pnl >= 0:
+            self.portfolio.winning_trades += 1
         else:
-            close_price = Decimal("0.5")
+            self.portfolio.losing_trades += 1
 
-        for pos_id, pos in matching:
-            # Kapanacak miktar
-            if close_ratio < Decimal("1"):
-                close_size = (pos.size_usd * close_ratio).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-                partial = True
-            else:
-                close_size = pos.size_usd
-                partial = False
-            
-            if close_size <= 0:
-                continue
+        del self.portfolio.open_positions[pos_id]
+        logging.info(f"CLOSED: {pos.trader_name} | PnL: ${pnl:.2f} | Cash: ${self.portfolio.cash:.2f}")
 
-            # DOĞRU PnL hesabı
-            shares = close_size / pos.entry_price
-            pnl = shares * (close_price - pos.entry_price)
-            
-            # Portföy güncelle
-            self.portfolio.cash += close_size + pnl
-            self.portfolio.realized_pnl += pnl
-            self.portfolio.total_trades += 1
-            
-            if pnl >= 0:
-                self.portfolio.winning_trades += 1
-            else:
-                self.portfolio.losing_trades += 1
-
-            if partial:
-                # Kısmi kapanış: pozisyonu güncelle
-                pos.size_usd -= close_size
-                logging.info(f"KISMİ KAPANIŞ: {pos.trader_name} | ${close_size:.2f} | PnL: ${pnl:.2f} | Kalan: ${pos.size_usd:.2f}")
-            else:
-                # Tam kapanış: pozisyonu sil
-                del self.portfolio.open_positions[pos_id]
-                logging.info(f"TAM KAPANIŞ: {pos.trader_name} | PnL: ${pnl:.2f} | Nakit: ${self.portfolio.cash:.2f}")
-
-            await notifier.send_close(pos, pnl, close_price, self.portfolio, partial=partial)
+        await notifier.send_close(pos, pnl, close_price, self.portfolio)
 
     async def scan_cycle(self):
         self.scan_count += 1
         async with self.tracker, self.notifier:
             result = await self.tracker.scan_all()
 
-            # ÖNCE kapanışları işle (nakit boşalsın)
-            for activity in result["closes"]:
-                await self.close_position(activity, self.notifier)
+            for activity in result["trades"]:
+                if self._is_open_trade(activity):
+                    await self.open_position(activity, self.notifier)
+                elif self._is_close_trade(activity):
+                    await self.close_position(activity, self.notifier)
 
-            # SONRA açılışları işle (nakit kontrolü sonrası)
-            for activity in result["opens"]:
-                await self.open_position(activity, self.notifier)
-
-            # Her 4 dakikada portföy özeti
             if self.scan_count % 16 == 0:
                 await self.notifier.send_portfolio(self.portfolio)
                 logging.info(
-                    f"Tarama #{self.scan_count} | "
-                    f"Toplam: ${self.portfolio.total_value:.2f} | "
-                    f"PnL: ${self.portfolio.total_pnl:.2f} | "
-                    f"Açık: {len(self.portfolio.open_positions)}"
+                    f"Scan #{self.scan_count} | "
+                    f"Total: ${self.portfolio.total_value:.2f} | "
+                    f"PnL: ${portfolio.total_pnl:.2f} | "
+                    f"Open: {len(self.portfolio.open_positions)}"
                 )
 
     async def run(self):
         self.running = True
         async with self.notifier:
             await self.notifier.send(
-                "🤖 *POLYMARKET COPY BOT v3.0 BAŞLADI*\n\n"
-                f"💰 Sermaye: ${Config.INITIAL_CAPITAL}\n"
-                f"💵 İşlem büyüklüğü: ${Config.TRADE_SIZE} (sabit)\n"
-                f"🔒 Min nakit: ${Config.MIN_CASH}\n"
-                f"⏰ Tarama: {Config.SCAN_INTERVAL} saniye\n"
-                f"👥 Takip: {len(Config.TRACKED_USERS)} trader\n\n"
-                "👥 *Takip listesi:*\n" +
-                "\n".join(f"• {u['name']}" for u in Config.TRACKED_USERS) +
-                "\n\n✅ v3.0 Düzeltmeler:\n"
-                "• Share miktar takibi\n"
-                "• Kısmi kapanış desteği\n"
-                "• Tek kaynak doğruluk\n"
-                "• Kesin nakit kontrolü"
+                "[POLYMARKET COPY BOT v3.2 STARTED]\n\n"
+                f"Capital: ${Config.INITIAL_CAPITAL}\n"
+                f"Trade Size: ${Config.TRADE_SIZE} (fixed)\n"
+                f"Min Cash: ${Config.MIN_CASH}\n"
+                f"Min Trade: ${Config.MIN_USDC_SIZE}\n"
+                f"Scan Interval: {Config.SCAN_INTERVAL} seconds\n"
+                f"Tracking: {len(Config.TRACKED_USERS)} traders\n\n"
+                "Tracking List:\n" +
+                "\n".join(f"- {u['name']}" for u in Config.TRACKED_USERS) +
+                "\n\nFixes:\n"
+                "- /activity endpoint for real trades\n"
+                "- Transaction hash deduplication\n"
+                "- Min trade size filter\n"
+                "- Strict cash control"
             )
 
         logging.info("=" * 50)
-        logging.info("POLYMARKET COPY BOT v3.0 BASLADI")
+        logging.info("POLYMARKET COPY BOT v3.2 STARTED")
         logging.info("=" * 50)
 
         while self.running:
@@ -532,19 +445,19 @@ class PolymarketCopyBot:
                 async with self.notifier:
                     await self.notifier.send_portfolio(self.portfolio)
                     await self.notifier.send(
-                        f"🛑 *BOT DURDURULDU*\n\n"
-                        f"Toplam Tarama: {self.scan_count}\n"
-                        f"Son Sermaye: ${self.portfolio.total_value:.2f}\n"
-                        f"Toplam PnL: ${self.portfolio.total_pnl:.2f}\n"
-                        f"İşlemler: {self.portfolio.total_trades} "
-                        f"({portfolio.winning_trades}W / {portfolio.losing_trades}L)"
+                        f"[BOT STOPPED]\n\n"
+                        f"Total Scans: {self.scan_count}\n"
+                        f"Final Capital: ${self.portfolio.total_value:.2f}\n"
+                        f"Total PnL: ${portfolio.total_pnl:.2f}\n"
+                        f"Trades: {self.portfolio.total_trades} "
+                        f"({self.portfolio.winning_trades}W / {self.portfolio.losing_trades}L)"
                     )
                 break
             except Exception as e:
-                logging.error(f"Hata: {e}")
+                logging.error(f"Error: {e}")
                 await asyncio.sleep(Config.SCAN_INTERVAL * 2)
 
-# ==================== ÇALIŞTIRMA ====================
+# ==================== RUN ====================
 if __name__ == "__main__":
     logging.basicConfig(
         level=logging.INFO,
